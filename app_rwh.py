@@ -1,6 +1,6 @@
 """
 Rainwater Harvesting (RWH) Design Tool
-Based on City of Tulsa LID Manual (2026) - Section 104
+Based on City of Tulsa LID Manual (2021) - Section 104
 
 Design Steps:
 1. Calculate Catchment Area
@@ -9,7 +9,7 @@ Design Steps:
 4. Size Slow-Release Orifice Outlet
 5. Size First Flush Diverter Pipe
 
-Reference: City of Tulsa Engineering Manual (2026), Section 104: Rainwater Harvesting
+Reference: City of Tulsa Engineering Manual (2021), Section 104: Rainwater Harvesting
 """
 
 import io
@@ -160,13 +160,14 @@ def calc_detention_time_hr(atank_ft2: float, do_in: float, h_actual_in: float) -
 
 
 # ============================================================================
-# TANK DATABASE (tanks_rwh.csv)
+# TANK DATABASE (excels/RWH_commerical_sizes.xlsx)
 # ============================================================================
 
 @st.cache_data
 def load_tanks_df() -> pd.DataFrame:
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excels/RWH_commerical_sizes.xlsx")
-    df = pd.read_csv(csv_path)
+    xlsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excels", "RWH_commerical_sizes.xlsx")
+    df = pd.read_excel(xlsx_path, header=None)
+    df.columns = ["capacity_gal", "unit", "name", "diameter_in", "width_in", "depth_in", "height_in", "sku", "price"]
     df["capacity_gal_num"] = pd.to_numeric(df["capacity_gal"], errors="coerce")
     df["diameter_in_num"]  = pd.to_numeric(df["diameter_in"],  errors="coerce")
     df["height_in_num"]    = pd.to_numeric(df["height_in"],    errors="coerce")
@@ -272,7 +273,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
         size=14, bold=True, color=colors.white,
     )
     sub_para = _p(
-        f"City of Tulsa LID Manual (2026) — Section 104 · Design Process      "
+        f"City of Tulsa LID Manual (2021) — Section 104 · Design Process      "
         f"Generated: {date.today().strftime('%B %d, %Y')}",
         size=7.5, color=colors.HexColor("#AED6F1"),
     )
@@ -372,7 +373,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
     # Footer
     story.append(Spacer(1, 10))
     footer_tbl = Table(
-        [[_p("Reference: City of Tulsa Engineering Manual (2026), Section 104: Rainwater Harvesting",
+        [[_p("Reference: City of Tulsa Engineering Manual (2021), Section 104: Rainwater Harvesting",
              size=7, color=colors.HexColor("#7F8C8D"))]],
         colWidths=[W],
     )
@@ -393,7 +394,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
 
 def main() -> None:
     st.title("Rainwater Harvesting (RWH) Design Tool")
-    st.caption("City of Tulsa LID Manual (2026) — Section 104 · Design Process")
+    st.caption("City of Tulsa LID Manual (2021) — Section 104 · Design Process")
 
     # ========================================================================
     # SIDEBAR
