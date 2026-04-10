@@ -165,7 +165,7 @@ def calc_detention_time_hr(atank_ft2: float, do_in: float, h_actual_in: float) -
 
 @st.cache_data
 def load_tanks_df() -> pd.DataFrame:
-    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excels/tanks_rwh.csv")
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excels/RWH_commerical_sizes.xlsx")
     df = pd.read_csv(csv_path)
     df["capacity_gal_num"] = pd.to_numeric(df["capacity_gal"], errors="coerce")
     df["diameter_in_num"]  = pd.to_numeric(df["diameter_in"],  errors="coerce")
