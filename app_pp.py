@@ -1,6 +1,6 @@
 """
 Permeable Pavement (PP) Design Tool
-Based on City of Tulsa LID Manual (2021) - Chapter 103
+Based on City of Tulsa LID Manual (2026) - Chapter 103
 
 This tool implements the design process for permeable pavements:
 1. Site Selection & Siting Offsets
@@ -372,7 +372,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
         size=14, bold=True, color=colors.white,
     )
     sub_para = _p(
-        f"City of Tulsa LID Manual (2021) — Chapter 103 · Design Process      "
+        f"City of Tulsa LID Manual (2026) — Chapter 103 · Design Process      "
         f"Generated: {date.today().strftime('%B %d, %Y')}",
         size=7.5, color=colors.HexColor("#AED6F1"),
     )
@@ -487,7 +487,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
 
 def main() -> None:
     st.title("Permeable Pavement (PP) Design Tool")
-    st.caption("City of Tulsa LID Manual (2021) — Chapter 103 · Design Process")
+    st.caption("City of Tulsa LID Manual (2026) — Chapter 103 · Design Process")
 
     # ========================================================================
     # SIDEBAR INPUTS

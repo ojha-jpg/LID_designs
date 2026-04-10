@@ -1,6 +1,6 @@
 """
 Bio-Retention Cell (BRC) Design Tool
-Based on City of Tulsa LID Manual (2021) - Chapter 101
+Based on City of Tulsa LID Manual (2026) - Chapter 101
 
 This tool implements the 10-step design process for bioretention cells:
 1. Site Selection & Siting Offsets
@@ -532,7 +532,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
         size=14, bold=True, color=colors.white,
     )
     sub_para = _p(
-        f"City of Tulsa LID Manual (2021) — Chapter 101 · 10-Step Design Process      "
+        f"City of Tulsa LID Manual (2026) — Chapter 101 · 10-Step Design Process      "
         f"Generated: {date.today().strftime('%B %d, %Y')}",
         size=7.5, color=colors.HexColor("#AED6F1"),
     )
@@ -659,7 +659,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
 
 def main() -> None:
     st.title("Bio-Retention Cell (BRC) Design Tool")
-    st.caption("City of Tulsa LID Manual (2021) — Chapter 101 · 10-Step Design Process")
+    st.caption("City of Tulsa LID Manual (2026) — Chapter 101 · 10-Step Design Process")
 
     # ========================================================================
     # SIDEBAR INPUTS

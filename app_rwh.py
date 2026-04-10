@@ -1,6 +1,6 @@
 """
 Rainwater Harvesting (RWH) Design Tool
-Based on City of Tulsa LID Manual (2021) - Section 104
+Based on City of Tulsa LID Manual (2026) - Section 104
 
 Design Steps:
 1. Calculate Catchment Area
@@ -160,14 +160,13 @@ def calc_detention_time_hr(atank_ft2: float, do_in: float, h_actual_in: float) -
 
 
 # ============================================================================
-# TANK DATABASE (excels/RWH_commerical_sizes.xlsx)
+# TANK DATABASE (tanks_rwh.csv)
 # ============================================================================
 
 @st.cache_data
 def load_tanks_df() -> pd.DataFrame:
-    xlsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excels", "RWH_commerical_sizes.xlsx")
-    df = pd.read_excel(xlsx_path, header=None)
-    df.columns = ["capacity_gal", "unit", "name", "diameter_in", "width_in", "depth_in", "height_in", "sku", "price"]
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tanks_rwh.csv")
+    df = pd.read_csv(csv_path)
     df["capacity_gal_num"] = pd.to_numeric(df["capacity_gal"], errors="coerce")
     df["diameter_in_num"]  = pd.to_numeric(df["diameter_in"],  errors="coerce")
     df["height_in_num"]    = pd.to_numeric(df["height_in"],    errors="coerce")
@@ -273,7 +272,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
         size=14, bold=True, color=colors.white,
     )
     sub_para = _p(
-        f"City of Tulsa LID Manual (2021) — Section 104 · Design Process      "
+        f"City of Tulsa LID Manual (2026) — Section 104 · Design Process      "
         f"Generated: {date.today().strftime('%B %d, %Y')}",
         size=7.5, color=colors.HexColor("#AED6F1"),
     )
@@ -394,7 +393,7 @@ def generate_pdf_report(inputs: dict, results: dict) -> bytes:
 
 def main() -> None:
     st.title("Rainwater Harvesting (RWH) Design Tool")
-    st.caption("City of Tulsa LID Manual (2021) — Section 104 · Design Process")
+    st.caption("City of Tulsa LID Manual (2026) — Section 104 · Design Process")
 
     # ========================================================================
     # SIDEBAR
