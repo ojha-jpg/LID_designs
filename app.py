@@ -1,6 +1,6 @@
 """
 LID Design Tools — Combined Application
-City of Tulsa Low Impact Development (LID) Manual (2021)
+City of Tulsa Low Impact Development (LID) Manual (2026)
 
 Entry point for the multi-page Streamlit app.
 Run with:  streamlit run app.py
@@ -20,7 +20,7 @@ from app_rwh import main as rwh_main
 def homepage() -> None:
     st.title("LID Design Tools")
     st.markdown(
-        "**City of Tulsa Low Impact Development (LID) Manual (2021)**  \n"
+        "**City of Tulsa Low Impact Development (LID) Manual (2026)**  \n"
         "Select a design tool from the sidebar or the cards below."
     )
     st.divider()
@@ -62,7 +62,7 @@ def homepage() -> None:
 
     st.divider()
     st.caption(
-        "City of Tulsa Engineering Manual (2021) · "
+        "City of Tulsa Engineering Manual (2026) · "
         "University of Oklahoma LID Project"
     )
 
