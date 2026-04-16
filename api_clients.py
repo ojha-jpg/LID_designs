@@ -6,17 +6,20 @@ Functions:
   get_basin_characteristics() — USGS StreamStats basin chars (area, Tc)
   get_peak_flow_regression()  — USGS NSS regression peak flows
   fetch_atlas14()             — NOAA Atlas 14 precipitation
-  fetch_soil_composition()    — USDA SSURGO hydrologic soil groups (local parquet)
-  fetch_soil_texture()        — USDA SSURGO surface soil texture (local gSSURGO GDB)
-  fetch_landuse_composition() — NLCD 2024 land use within watershed (local raster)
+  fetch_soil_composition()    — USDA SSURGO hydrologic soil groups (SDA API)
+  fetch_soil_texture()        — USDA SSURGO surface soil texture (SDA API)
+  fetch_landuse_composition() — NLCD 2024 land use within watershed (MRLC WCS API)
 """
 
 import json
 import csv
 import os
+import tempfile
 import requests
 import numpy as np
-from shapely.geometry import shape
+from pyproj import Transformer
+from shapely.geometry import shape, mapping
+from shapely.ops import transform as shp_transform
 
 from reference_data import (
     RETURN_PERIODS,
@@ -26,15 +29,191 @@ from noaa_atlas14 import fetch_idf, IDF
 
 
 # ---------------------------------------------------------------------------
-# Local SSURGO soil data paths
+# USDA SDA API — WFS spatial service + tabular REST
 # ---------------------------------------------------------------------------
 
-_LOCAL_SOIL_PARQUET = "/Users/ashishojha/Documents/LID excels/ok_ssurgo_spatial/ok_soilmu.parquet"
-_GSSURGO_GDB = "/Users/ashishojha/Documents/LID excels/soil data/gSSURGO_OK.gdb"
+_SDA_WFS_URL    = "https://sdmdataaccess.sc.egov.usda.gov/Spatial/SDMWGS84Geographic.wfs"
+_SDA_TABULAR_URL = "https://SDMDataAccess.sc.egov.usda.gov/Tabular/SDMTabularService/post.rest"
+_WFS_BBOX_BUFFER = 0.005   # degrees; pads bbox so edge polygons are included
+_SDA_CHUNK       = 400     # max mukeys per tabular IN (...) clause
 
-# Module-level caches — loaded once per process
-_SOIL_GDF = None      # statewide soil polygons GeoDataFrame
-_TEX_LOOKUP = None    # mukey (str) → texdesc (str)
+
+def _sda_tabular_query(sql: str) -> list:
+    """POST a plain-SQL query to the SDA tabular REST endpoint; returns list of row dicts."""
+    payload = {"query": sql, "FORMAT": "JSON+COLUMNNAME"}
+    resp = requests.post(_SDA_TABULAR_URL, data=payload, timeout=120)
+    resp.raise_for_status()
+    rows = resp.json().get("Table", [])
+    if not rows:
+        return []
+    header = rows[0]
+    return [dict(zip(header, row)) for row in rows[1:]]
+
+
+def _fetch_soil_gdf_wfs(geom):
+    """
+    Download SSURGO map-unit polygon geometries from the SDA WFS for the
+    geometry's bounding box, clip to the exact geometry, and compute clipped
+    area in acres (EPSG:5070 equal-area projection).
+
+    Returns a GeoDataFrame (EPSG:4326) with columns:
+      MUKEY, MUSYM, geometry, clip_area_acres
+    Raises ValueError if no features are returned.
+    """
+    import geopandas as gpd
+
+    minx, miny, maxx, maxy = geom.bounds
+    minx -= _WFS_BBOX_BUFFER;  miny -= _WFS_BBOX_BUFFER
+    maxx += _WFS_BBOX_BUFFER;  maxy += _WFS_BBOX_BUFFER
+
+    wfs_url = (
+        f"{_SDA_WFS_URL}?SERVICE=WFS&VERSION=1.0.0&REQUEST=GetFeature"
+        f"&TYPENAME=MapunitPoly&BBOX={minx},{miny},{maxx},{maxy}"
+    )
+    gdf = gpd.read_file(wfs_url)
+
+    if gdf.empty:
+        raise ValueError("SDA WFS returned no features for watershed bounding box")
+
+    # Ensure EPSG:4326
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    # Normalise column names to UPPER (WFS returns lowercase)
+    gdf = gdf.rename(columns={c: c.upper() for c in gdf.columns if c != "geometry"})
+
+    # Clip to exact watershed boundary
+    ws_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
+    clipped = gpd.clip(gdf, ws_gdf)
+    if clipped.empty:
+        raise ValueError("No soil polygons found within watershed boundary (WFS)")
+
+    clipped = clipped.copy()
+    clipped["clip_area_acres"] = clipped.to_crs("EPSG:5070").geometry.area / 4046.856
+    return clipped
+
+
+def _fetch_hsg_for_mukeys(mukeys: list) -> dict:
+    """
+    Return {mukey: dominant_hsg} via SDA tabular API.
+    Dominant = highest comppct_r major component with a valid hydgrp.
+    Dual-class HSG (e.g. 'A/D') → drained class (first letter).
+    """
+    in_str = ", ".join(f"'{k}'" for k in mukeys)
+    sql = f"""
+    SELECT co.mukey, co.comppct_r, co.hydgrp
+    FROM   component co
+    WHERE  co.mukey       IN ({in_str})
+      AND  co.majcompflag = 'Yes'
+      AND  co.hydgrp      IS NOT NULL
+    ORDER BY co.mukey, co.comppct_r DESC
+    """
+    rows = _sda_tabular_query(sql)
+
+    best: dict = {}   # mukey → (comppct_r, hsg)
+    for row in rows:
+        mukey = str(row.get("mukey") or "").strip()
+        try:
+            pct = float(row.get("comppct_r") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        hsg = str(row.get("hydgrp") or "").strip().upper().split("/")[0]
+        if mukey and (mukey not in best or pct > best[mukey][0]):
+            best[mukey] = (pct, hsg)
+
+    return {mk: hsg for mk, (_, hsg) in best.items()}
+
+
+def _fetch_texture_for_mukeys(mukeys: list) -> dict:
+    """
+    Return {mukey: texdesc} via SDA tabular API.
+    Surface horizon of the dominant major component (rv indicator = Yes).
+    """
+    in_str = ", ".join(f"'{k}'" for k in mukeys)
+    sql = f"""
+    SELECT co.mukey, co.comppct_r, ch.hzdept_r, chtg.texdesc
+    FROM   component     co
+    JOIN   chorizon      ch   ON ch.cokey   = co.cokey
+    JOIN   chtexturegrp  chtg ON chtg.chkey = ch.chkey
+                              AND chtg.rvindicator = 'Yes'
+    WHERE  co.mukey       IN ({in_str})
+      AND  co.majcompflag = 'Yes'
+    ORDER BY co.mukey, co.comppct_r DESC, ch.hzdept_r ASC
+    """
+    rows = _sda_tabular_query(sql)
+
+    best: dict = {}   # mukey → texdesc (first row per mukey wins due to ORDER BY)
+    for row in rows:
+        mukey = str(row.get("mukey") or "").strip()
+        if mukey not in best:
+            tex = str(row.get("texdesc") or "Unknown").strip()
+            if not tex or tex.lower() in ("none", "null", ""):
+                tex = "Unknown"
+            best[mukey] = tex
+
+    return best
+
+
+def _fetch_soil_composition_api(watershed_geojson: dict) -> dict:
+    """
+    HSG area fractions via SDA WFS + tabular API (no local files required).
+
+    Returns {"A": %, "B": %, "C": %, "D": %} summing to ~100.
+    """
+    geom    = _extract_geometry(watershed_geojson)
+    clipped = _fetch_soil_gdf_wfs(geom)
+
+    mukeys = clipped["MUKEY"].astype(str).unique().tolist()
+    hsg_lookup: dict = {}
+    for i in range(0, len(mukeys), _SDA_CHUNK):
+        hsg_lookup.update(_fetch_hsg_for_mukeys(mukeys[i : i + _SDA_CHUNK]))
+
+    totals     = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+    total_area = 0.0
+    for _, row in clipped.iterrows():
+        hsg  = hsg_lookup.get(str(row["MUKEY"]).strip(), "")
+        area = float(row["clip_area_acres"])
+        total_area += area
+        if hsg in totals:
+            totals[hsg] += area
+
+    if total_area == 0:
+        raise ValueError("No classifiable HSG data from SDA API")
+
+    return {g: round(100.0 * a / total_area, 1) for g, a in totals.items()}
+
+
+def _fetch_soil_texture_api(watershed_geojson: dict) -> dict:
+    """
+    Area-weighted surface soil texture via SDA WFS + tabular API.
+
+    Returns {"Silt loam": %, ...} sorted by area descending.
+    """
+    geom    = _extract_geometry(watershed_geojson)
+    clipped = _fetch_soil_gdf_wfs(geom)
+
+    mukeys = clipped["MUKEY"].astype(str).unique().tolist()
+    tex_lookup: dict = {}
+    for i in range(0, len(mukeys), _SDA_CHUNK):
+        tex_lookup.update(_fetch_texture_for_mukeys(mukeys[i : i + _SDA_CHUNK]))
+
+    tex_areas: dict = {}
+    total = 0.0
+    for _, row in clipped.iterrows():
+        tex  = tex_lookup.get(str(row["MUKEY"]).strip(), "Unknown")
+        area = float(row["clip_area_acres"])
+        tex_areas[tex] = tex_areas.get(tex, 0.0) + area
+        total += area
+
+    if total == 0:
+        raise ValueError("Zero total area in texture calculation (API)")
+
+    return {
+        tex: round(100.0 * area / total, 1)
+        for tex, area in sorted(tex_areas.items(), key=lambda x: -x[1])
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +239,7 @@ def delineate_watershed(lat: float, lon: float, region: str = "OK") -> dict:
         "lat": lat,
         "lon": lon,
         "includeparameters": "true",
-        "includeflowtypes": "false",
+        "includeflowtypes": "true",
         "includefeatures": "true",
         "simplify": "true",
     }
@@ -233,237 +412,145 @@ def fetch_atlas14(lat: float, lon: float) -> tuple[IDF, bool]:
 # USDA SSURGO — Soil hydrologic group composition
 # ---------------------------------------------------------------------------
 
-def _load_soil_gdf():
-    """
-    Load the statewide Oklahoma soil GeoDataFrame from the local parquet cache.
-    Cached in a module-level variable so it is only read from disk once per process.
-    """
-    global _SOIL_GDF
-    if _SOIL_GDF is None:
-        import geopandas as gpd
-        _SOIL_GDF = gpd.read_parquet(_LOCAL_SOIL_PARQUET)
-    return _SOIL_GDF
-
-
-def _fetch_soil_composition_local(watershed_geojson: dict) -> dict:
-    """
-    Compute HSG area fractions by clipping the local ok_soilmu.parquet to the
-    watershed boundary and summing clipped polygon areas per dominant_hsg group.
-
-    Returns {"A": %, "B": %, "C": %, "D": %} with values summing to ~100.
-    Raises ValueError if no HSG data is found within the watershed.
-    """
-    import geopandas as gpd
-
-    geom = _extract_geometry(watershed_geojson)
-    soil_gdf = _load_soil_gdf()
-
-    # Build a single-row GeoDataFrame for the watershed in the soil data's CRS
-    ws_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-    if soil_gdf.crs is not None and soil_gdf.crs != ws_gdf.crs:
-        ws_gdf = ws_gdf.to_crs(soil_gdf.crs)
-
-    # Clip soil polygons to the watershed boundary
-    clipped = gpd.clip(soil_gdf, ws_gdf)
-    if clipped.empty:
-        raise ValueError("No soil polygons found within watershed boundary")
-
-    # Project to equal-area CRS (NAD83 / Conus Albers) for accurate area calculation
-    clipped_ea = clipped.to_crs("EPSG:5070")
-    clipped_ea = clipped_ea.copy()
-    clipped_ea["_clip_area_m2"] = clipped_ea.geometry.area
-
-    totals = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-    total_area = 0.0
-
-    for _, row in clipped_ea.iterrows():
-        hsg = str(row.get("dominant_hsg", "")).strip().upper()
-        # Handle dual-class soils (e.g. "A/D") — use drained (first) class
-        hsg = hsg.split("/")[0]
-        if hsg in totals:
-            area = float(row["_clip_area_m2"])
-            totals[hsg] += area
-            total_area += area
-
-    if total_area == 0:
-        raise ValueError("No classifiable HSG data in clipped soil polygons")
-
-    return {g: round(100.0 * area / total_area, 1) for g, area in totals.items()}
-
-
 def fetch_soil_composition(watershed_geojson: dict) -> tuple[dict, bool]:
     """
-    Return hydrologic soil group composition for the watershed.
-
-    Uses local ok_soilmu.parquet (spatial clip).
+    Return hydrologic soil group composition for the watershed via SDA API.
 
     Returns ({"A": %, "B": %, "C": %, "D": %}, is_live: bool).
-    Raises RuntimeError if the local data is missing or the clip fails.
+    Raises RuntimeError on failure.
     """
     try:
-        return _fetch_soil_composition_local(watershed_geojson), True
+        return _fetch_soil_composition_api(watershed_geojson), True
     except Exception as e:
-        raise RuntimeError(f"Soil data (SSURGO) failed: {e}") from e
+        raise RuntimeError(f"Soil data (SSURGO API) failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------
-# USDA gSSURGO — Surface soil texture
+# USDA SSURGO — Surface soil texture (API)
 # ---------------------------------------------------------------------------
-
-def _load_tex_lookup() -> dict:
-    """
-    Build a mukey → texdesc dict from the local gSSURGO GDB. Cached.
-
-    Join chain (mirrors soil_maps_imhoff.ipynb):
-      component (dominant major comp) → chorizon (surface horizon) → chtexturegrp (rv)
-    """
-    global _TEX_LOOKUP
-    if _TEX_LOOKUP is not None:
-        return _TEX_LOOKUP
-
-    import fiona
-    import pandas as pd
-
-    with fiona.open(_GSSURGO_GDB, layer="component") as src:
-        comp = pd.DataFrame([f["properties"] for f in src])[
-            ["mukey", "cokey", "comppct_r", "majcompflag"]
-        ]
-    major_comp = (
-        comp[comp["majcompflag"] == "Yes"]
-        .sort_values("comppct_r", ascending=False)
-        .drop_duplicates("mukey", keep="first")
-    )
-
-    with fiona.open(_GSSURGO_GDB, layer="chorizon") as src:
-        hor = pd.DataFrame([f["properties"] for f in src])[["cokey", "chkey", "hzdept_r"]]
-    surface_hor = hor.sort_values("hzdept_r").drop_duplicates("cokey", keep="first")
-
-    with fiona.open(_GSSURGO_GDB, layer="chtexturegrp") as src:
-        tgrp = pd.DataFrame([f["properties"] for f in src])
-    tgrp_rv = tgrp[tgrp["rvindicator"] == "Yes"][["chkey", "texdesc"]]
-
-    lookup = (
-        major_comp[["mukey", "cokey"]]
-        .merge(surface_hor[["cokey", "chkey"]], on="cokey", how="left")
-        .merge(tgrp_rv, on="chkey", how="left")
-        .set_index("mukey")["texdesc"]
-        .fillna("Unknown")
-        .to_dict()
-    )
-
-    _TEX_LOOKUP = lookup
-    return _TEX_LOOKUP
-
 
 def fetch_soil_texture(watershed_geojson: dict) -> tuple[dict, bool]:
     """
-    Return area-weighted surface soil texture composition for the watershed.
-
-    Clips ok_soilmu.parquet to the watershed, looks up texdesc from gSSURGO_OK.gdb,
-    and returns percentages sorted by area descending.
+    Return area-weighted surface soil texture composition via SDA API.
 
     Returns ({"Silt loam": %, "Fine sandy loam": %, ...}, is_live: bool).
-    Falls back to ({}, False) if either local file is unavailable.
+    Returns ({}, False) on failure.
     """
     try:
-        import geopandas as gpd
-
-        geom = _extract_geometry(watershed_geojson)
-        soil_gdf = _load_soil_gdf()
-
-        ws_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-        if soil_gdf.crs is not None and soil_gdf.crs != ws_gdf.crs:
-            ws_gdf = ws_gdf.to_crs(soil_gdf.crs)
-
-        # Bbox pre-filter then precise intersection
-        minx, miny, maxx, maxy = ws_gdf.total_bounds
-        soil_bbox = soil_gdf.cx[minx:maxx, miny:maxy]
-        clipped = gpd.overlay(soil_bbox, ws_gdf, how="intersection")
-
-        if clipped.empty:
-            raise ValueError("No soil polygons found within watershed boundary")
-
-        # Area in acres (equal-area projection)
-        clipped_ea = clipped.to_crs("EPSG:5070")
-        clipped = clipped.copy()
-        clipped["area_acres"] = clipped_ea.geometry.area / 4046.856
-        clipped["MUKEY"] = clipped["MUKEY"].astype(str)
-
-        # Join texture
-        tex_lookup = _load_tex_lookup()
-        clipped["texdesc"] = clipped["MUKEY"].map(tex_lookup).fillna("Unknown")
-
-        tex_areas = clipped.groupby("texdesc")["area_acres"].sum()
-        total = tex_areas.sum()
-        if total == 0:
-            raise ValueError("Zero total area in texture calculation")
-
-        result = {
-            tex: round(100.0 * area / total, 1)
-            for tex, area in tex_areas.sort_values(ascending=False).items()
-        }
-        return result, True
-
+        return _fetch_soil_texture_api(watershed_geojson), True
     except Exception:
         return {}, False
 
 
 # ---------------------------------------------------------------------------
-# NLCD 2024 — Land use composition (local raster)
+# NLCD — Land use composition via MRLC WCS API
 # ---------------------------------------------------------------------------
 
-_LOCAL_NLCD_RASTER = (
-    "/Users/ashishojha/Documents/LID excels/landuse /"
-    "Annual_NLCD_LndCov_2024_CU_C1V1/Annual_NLCD_LndCov_2024_CU_C1V1.tif"
+_NLCD_WCS_BASE = (
+    "https://dmsdata.cr.usgs.gov/geoserver/"
+    "mrlc_Land-Cover-Native_conus_year_data/wcs"
 )
+_NLCD_COVERAGE = (
+    "mrlc_Land-Cover-Native_conus_year_data:"
+    "Land-Cover-Native_conus_year_data"
+)
+_NLCD_YEAR       = 2024
+_NLCD_BBOX_BUF   = 0.01   # degrees — pads tile so boundary pixels are included
+
+
+def _fetch_nlcd_tile_wcs(geom):
+    """
+    Download an NLCD land cover tile from the MRLC WCS for the watershed bbox.
+
+    The WCS native CRS is EPSG:5070 (Albers Equal Area, 30 m pixels).
+    GeoServer returns an unnamed LOCAL_CS, so EPSG:5070 is hardcoded for all
+    geometry reprojection — do NOT read raster CRS from src.crs.
+
+    Returns (data, win_transform, nodata, inside_mask) where:
+      data         — 2D uint8 ndarray of NLCD codes (full tile, unmasked)
+      win_transform— affine transform of the tile in EPSG:5070
+      nodata       — scalar nodata value or None
+      inside_mask  — boolean 2D ndarray, True for pixels inside the watershed
+    """
+    import rasterio
+    from rasterio.features import geometry_mask
+
+    # Expand bbox in WGS84, project to EPSG:5070
+    minx, miny, maxx, maxy = geom.bounds
+    minx -= _NLCD_BBOX_BUF; miny -= _NLCD_BBOX_BUF
+    maxx += _NLCD_BBOX_BUF; maxy += _NLCD_BBOX_BUF
+
+    t4326_5070 = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
+    x0, y0 = t4326_5070.transform(minx, miny)
+    x1, y1 = t4326_5070.transform(maxx, maxy)
+    bx0, by0, bx1, by1 = min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+    # Native resolution is 30 m
+    px_w = max(10, round((bx1 - bx0) / 30))
+    px_h = max(10, round((by1 - by0) / 30))
+
+    resp = requests.get(
+        _NLCD_WCS_BASE,
+        params={
+            "SERVICE":  "WCS",
+            "VERSION":  "1.0.0",
+            "REQUEST":  "GetCoverage",
+            "COVERAGE": _NLCD_COVERAGE,
+            "CRS":      "EPSG:5070",
+            "BBOX":     f"{bx0},{by0},{bx1},{by1}",
+            "WIDTH":    str(px_w),
+            "HEIGHT":   str(px_h),
+            "FORMAT":   "GeoTIFF",
+            "TIME":     f"{_NLCD_YEAR}-01-01T00:00:00.000Z",
+        },
+        timeout=60,
+        stream=True,
+    )
+    resp.raise_for_status()
+    if "xml" in resp.headers.get("Content-Type", "") or \
+       "html" in resp.headers.get("Content-Type", ""):
+        raise RuntimeError(f"MRLC WCS error: {resp.text[:300]}")
+
+    fd, tmp = tempfile.mkstemp(suffix="_nlcd_wcs.tif")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            for chunk in resp.iter_content(65536):
+                fh.write(chunk)
+
+        with rasterio.open(tmp) as src:
+            data   = src.read(1, masked=False)
+            win_tf = src.transform
+            nodata = src.nodata
+
+    finally:
+        os.unlink(tmp)
+
+    # Reproject watershed geometry to EPSG:5070 for the pixel mask
+    geom_5070 = shp_transform(t4326_5070.transform, geom)
+    inside = geometry_mask(
+        [mapping(geom_5070)],
+        out_shape=data.shape,
+        transform=win_tf,
+        invert=True,
+        all_touched=False,
+    )
+    return data, win_tf, nodata, inside
 
 
 def fetch_landuse_composition(watershed_geojson: dict) -> tuple[dict, bool]:
     """
-    Clip the local NLCD 2024 raster to the watershed and compute land use fractions.
-
-    Uses a rasterio windowed read + geometry mask — no HTTP call required.
+    Fetch NLCD land cover from the MRLC WCS API and compute land use fractions.
 
     Returns ({"Pasture/Meadow": %, ...}, is_live: bool).
-    Raises RuntimeError if the raster is missing or the clip fails.
+    Raises RuntimeError on failure.
     """
     try:
-        import rasterio
-        from rasterio.features import geometry_mask
-        from rasterio.windows import from_bounds
-        from rasterio.warp import transform_bounds, transform_geom
-
         geom = _extract_geometry(watershed_geojson)
-        minx, miny, maxx, maxy = geom.bounds
+        data, _, nodata, inside = _fetch_nlcd_tile_wcs(geom)
 
-        with rasterio.open(_LOCAL_NLCD_RASTER) as src:
-            # Convert WGS84 bounds to the raster's CRS for a windowed read
-            win_bounds = transform_bounds(
-                "EPSG:4326", src.crs, minx, miny, maxx, maxy, densify_pts=21
-            )
-            win = from_bounds(*win_bounds, src.transform).round_offsets().round_lengths()
-            if win.width <= 0 or win.height <= 0:
-                raise ValueError("Watershed extent too small for raster window")
-
-            data = src.read(1, window=win, masked=False)
-            win_transform = src.window_transform(win)
-
-            # Reproject watershed geometry to raster CRS for masking
-            geom_raster_crs = transform_geom(
-                "EPSG:4326", src.crs, geom.__geo_interface__
-            )
-            inside = geometry_mask(
-                [geom_raster_crs],
-                out_shape=data.shape,
-                transform=win_transform,
-                invert=True,
-                all_touched=False,
-            )
-            pixel_values = data[inside]
-
-        # Exclude nodata and background zeros
-        if src.nodata is not None:
-            pixel_values = pixel_values[pixel_values != src.nodata]
+        pixel_values = data[inside]
+        if nodata is not None:
+            pixel_values = pixel_values[pixel_values != nodata]
         pixel_values = pixel_values[pixel_values > 0]
 
         return _nlcd_pixels_to_landuse(pixel_values), True
@@ -493,36 +580,28 @@ def _nlcd_pixels_to_landuse(pixel_values: np.ndarray) -> dict:
 
 def fetch_soil_geodataframe(watershed_geojson: dict):
     """
-    Clip SSURGO soil polygons to the watershed and attach texture labels.
+    Clip SSURGO soil polygons to the watershed and attach HSG + texture labels via SDA API.
 
     Returns a GeoDataFrame (EPSG:4326) with columns:
       geometry, MUKEY, MUSYM, dominant_hsg, texdesc, area_acres
     and (is_live: bool).  Returns (None, False) on failure.
     """
     try:
-        import geopandas as gpd
+        geom    = _extract_geometry(watershed_geojson)
+        clipped = _fetch_soil_gdf_wfs(geom)
 
-        geom     = _extract_geometry(watershed_geojson)
-        soil_gdf = _load_soil_gdf()
-
-        ws_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-        if soil_gdf.crs is not None and soil_gdf.crs != ws_gdf.crs:
-            ws_gdf = ws_gdf.to_crs(soil_gdf.crs)
-
-        minx, miny, maxx, maxy = ws_gdf.total_bounds
-        soil_bbox = soil_gdf.cx[minx:maxx, miny:maxy]
-        clipped   = gpd.overlay(soil_bbox, ws_gdf, how="intersection")
-
-        if clipped.empty:
-            return None, False
+        mukeys = clipped["MUKEY"].astype(str).unique().tolist()
+        hsg_lookup: dict = {}
+        tex_lookup: dict = {}
+        for i in range(0, len(mukeys), _SDA_CHUNK):
+            chunk = mukeys[i : i + _SDA_CHUNK]
+            hsg_lookup.update(_fetch_hsg_for_mukeys(chunk))
+            tex_lookup.update(_fetch_texture_for_mukeys(chunk))
 
         clipped = clipped.copy()
-        clipped["MUKEY"] = clipped["MUKEY"].astype(str) if "MUKEY" in clipped.columns else ""
-        clipped["area_acres"] = clipped.to_crs("EPSG:5070").geometry.area / 4046.856
-
-        # Join texture description
-        tex_lookup = _load_tex_lookup()            # mukey → texdesc
-        clipped["texdesc"] = clipped["MUKEY"].map(tex_lookup).fillna("Unknown")
+        clipped["dominant_hsg"] = clipped["MUKEY"].astype(str).map(hsg_lookup).fillna("")
+        clipped["texdesc"]      = clipped["MUKEY"].astype(str).map(tex_lookup).fillna("Unknown")
+        clipped["area_acres"]   = clipped["clip_area_acres"]
 
         return clipped.to_crs("EPSG:4326"), True
 
@@ -532,38 +611,15 @@ def fetch_soil_geodataframe(watershed_geojson: dict):
 
 def fetch_nlcd_array(watershed_geojson: dict):
     """
-    Clip the NLCD 2024 raster to the watershed and return the pixel array.
+    Fetch NLCD land cover from the MRLC WCS API and return the pixel array.
 
-    Returns (2D np.ndarray of uint8 NLCD codes, is_live: bool).
+    Returns (2D np.ndarray of uint16 NLCD codes, is_live: bool).
     Pixels outside the watershed boundary are set to 0.
     Returns (None, False) on failure.
     """
     try:
-        import rasterio
-        from rasterio.features import geometry_mask
-        from rasterio.windows import from_bounds
-        from rasterio.warp import transform_bounds, transform_geom
-
         geom = _extract_geometry(watershed_geojson)
-        minx, miny, maxx, maxy = geom.bounds
-
-        with rasterio.open(_LOCAL_NLCD_RASTER) as src:
-            win_bounds = transform_bounds(
-                "EPSG:4326", src.crs, minx, miny, maxx, maxy, densify_pts=21
-            )
-            win = from_bounds(*win_bounds, src.transform).round_offsets().round_lengths()
-            if win.width <= 0 or win.height <= 0:
-                raise ValueError("Extent too small")
-
-            data      = src.read(1, window=win, masked=False)
-            win_tf    = src.window_transform(win)
-            nodata    = src.nodata
-
-            geom_rcrs = transform_geom("EPSG:4326", src.crs, geom.__geo_interface__)
-            inside = geometry_mask(
-                [geom_rcrs], out_shape=data.shape,
-                transform=win_tf, invert=True, all_touched=False,
-            )
+        data, _, nodata, inside = _fetch_nlcd_tile_wcs(geom)
 
         arr = np.where(inside, data, 0).astype(np.uint16)
         if nodata is not None:
@@ -596,49 +652,27 @@ def fetch_landuse_soil_intersection(watershed_geojson: dict) -> tuple[dict, bool
     sum to ~100.  Falls back to ({}, False) if either local dataset fails.
     """
     try:
-        import rasterio
-        from rasterio.features import geometry_mask, rasterize as rio_rasterize
-        from rasterio.windows import from_bounds
-        from rasterio.warp import transform_bounds, transform_geom
+        from rasterio.features import rasterize as rio_rasterize
         import geopandas as gpd
 
         geom = _extract_geometry(watershed_geojson)
-        minx, miny, maxx, maxy = geom.bounds
 
-        # --- Step 1: windowed NLCD read ---
-        with rasterio.open(_LOCAL_NLCD_RASTER) as src:
-            win_bounds = transform_bounds(
-                "EPSG:4326", src.crs, minx, miny, maxx, maxy, densify_pts=21
-            )
-            win = from_bounds(*win_bounds, src.transform).round_offsets().round_lengths()
-            if win.width <= 0 or win.height <= 0:
-                raise ValueError("Watershed extent too small for raster window")
+        # --- Step 1: fetch NLCD tile via WCS ---
+        nlcd_data, win_tf, nodata, ws_mask = _fetch_nlcd_tile_wcs(geom)
+        # The tile is in EPSG:5070; hardcode this for soil reprojection below.
+        _RASTER_CRS = "EPSG:5070"
 
-            nlcd_data   = src.read(1, window=win, masked=False)
-            win_tf      = src.window_transform(win)
-            raster_crs  = src.crs
-            nodata      = src.nodata
-
-            geom_rcrs = transform_geom("EPSG:4326", raster_crs, geom.__geo_interface__)
-            ws_mask = geometry_mask(
-                [geom_rcrs],
-                out_shape=nlcd_data.shape,
-                transform=win_tf,
-                invert=True,
-                all_touched=False,
-            )
-
-        # --- Step 2: clip SSURGO polygons to watershed, reproject to raster CRS ---
-        soil_gdf = _load_soil_gdf()
-        ws_gdf   = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-        if soil_gdf.crs is not None and soil_gdf.crs != ws_gdf.crs:
-            ws_gdf = ws_gdf.to_crs(soil_gdf.crs)
-
-        clipped_soil = gpd.clip(soil_gdf, ws_gdf)
-        if clipped_soil.empty:
-            raise ValueError("No SSURGO polygons in watershed")
-
-        clipped_soil_rcrs = clipped_soil.to_crs(raster_crs)
+        # --- Step 2: clip SSURGO polygons to watershed via SDA API, reproject to EPSG:5070 ---
+        clipped_api = _fetch_soil_gdf_wfs(geom)
+        mukeys_api  = clipped_api["MUKEY"].astype(str).unique().tolist()
+        hsg_lkp_api: dict = {}
+        for i in range(0, len(mukeys_api), _SDA_CHUNK):
+            hsg_lkp_api.update(_fetch_hsg_for_mukeys(mukeys_api[i : i + _SDA_CHUNK]))
+        clipped_api = clipped_api.copy()
+        clipped_api["dominant_hsg"] = (
+            clipped_api["MUKEY"].astype(str).map(hsg_lkp_api).fillna("")
+        )
+        clipped_soil_rcrs = clipped_api.to_crs(_RASTER_CRS)
 
         # --- Step 3: rasterise HSG onto the NLCD grid ---
         shapes = []
@@ -706,6 +740,279 @@ def intersection_to_landuse_pct(intersection_pct: dict) -> dict[str, float]:
     for (lu, _), pct in intersection_pct.items():
         totals[lu] = totals.get(lu, 0.0) + pct
     return {lu: round(v, 1) for lu, v in sorted(totals.items(), key=lambda x: -x[1])}
+
+
+# ---------------------------------------------------------------------------
+# DEM-based watershed features (USGS 3DEP + pysheds)
+# ---------------------------------------------------------------------------
+
+_DEM_WCS = (
+    "https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/"
+    "ImageServer/WCSServer"
+)
+
+# Module-level sentinel: reset to False whenever this module is (re)loaded.
+# Using a module variable rather than a flag on np.can_cast means a Streamlit
+# hot-reload of api_clients.py always re-applies the patch to the live numpy
+# object, avoiding stale/buggy patches surviving across reloads.
+_NUMPY_PATCHED: bool = False
+
+
+def _patch_numpy_for_pysheds():
+    """
+    Patch np.can_cast once per module-load for NumPy 2 / pysheds 0.4 (NEP-50).
+    NumPy 2 raises TypeError when np.can_cast is called with a Python scalar;
+    pysheds 0.4 does this internally. The patch falls back to a NaN-aware
+    round-trip check so both NaN and finite nodata values are handled correctly.
+    """
+    global _NUMPY_PATCHED
+    if _NUMPY_PATCHED:
+        return
+    _orig = np.can_cast
+
+    import math as _math
+
+    def _safe(from_, to, casting="unsafe"):  # type: ignore[override]
+        try:
+            return _orig(from_, to, casting=casting)  # type: ignore[arg-type]
+        except TypeError:
+            # NumPy 2 NEP-50: Python scalars raise TypeError in can_cast.
+            try:
+                orig_v = float(from_)
+                conv_v = float(np.array(from_, dtype=to))
+                # NaN is representable in any float dtype, but nan != nan (IEEE 754)
+                return (_math.isnan(orig_v) and _math.isnan(conv_v)) or (orig_v == conv_v)
+            except (OverflowError, ValueError):
+                return False
+
+    np.can_cast = _safe
+    _NUMPY_PATCHED = True
+
+
+def fetch_dem_features(
+    watershed_geojson: dict | None,
+    pour_lat: float | None = None,
+    pour_lon: float | None = None,
+) -> tuple[dict, bool]:
+    """
+    Download USGS 3DEP 1/3 arc-second DEM and compute DEM-based watershed features.
+
+    Uses the StreamStats watershed boundary (watershed_geojson) as the analysis mask.
+    Runs pysheds D8 routing on the full downloaded DEM tile (no clip_to), snaps the
+    pour point to the nearest high-accumulation cell, then calls distance_to_outlet to
+    get the longest flow path within the StreamStats boundary.
+
+    Parameters
+    ----------
+    watershed_geojson : GeoJSON FeatureCollection from delineate_watershed()
+    pour_lat / pour_lon : outlet / pour-point coordinates (required for stream snap)
+
+    Returns (result_dict, is_live: bool).
+    result_dict keys:
+      flow_length_ft  — longest D8 flow-path (ft) within the StreamStats boundary
+      mean_slope_pct  — mean basin slope in percent
+      elev_min_m      — minimum elevation in metres within the watershed
+      elev_max_m      — maximum elevation in metres within the watershed
+      dem_array       — float64 ndarray, elevation (m); NaN outside watershed
+      dem_bounds      — (west, south, east, north) of the downloaded DEM tile (WGS84)
+      res_mx          — pixel width  in metres
+      res_my          — pixel height in metres
+    Falls back to ({"_error": ..., "_traceback": ...}, False) on any error.
+    """
+    import tempfile
+    import os as _os
+    import rasterio
+    from rasterio.features import geometry_mask as _geom_mask
+
+    if watershed_geojson is None:
+        return {"_error": "watershed_geojson is required"}, False
+
+    _patch_numpy_for_pysheds()
+    from pysheds.grid import Grid
+
+    tmp_raw = tmp_dem = None
+    try:
+        # --- Derive bbox from StreamStats GeoJSON boundary ---
+        from shapely.geometry import shape as _sshape
+        if watershed_geojson.get("type") == "FeatureCollection":
+            ws_shape = _sshape(watershed_geojson["features"][0]["geometry"])
+        else:
+            ws_shape = _sshape(watershed_geojson.get("geometry", watershed_geojson))
+
+        minx, miny, maxx, maxy = ws_shape.bounds
+        buffer = 0.02   # ~2 km buffer so boundary cells are well inside the DEM tile
+        bbox_w = minx - buffer
+        bbox_e = maxx + buffer
+        bbox_s = miny - buffer
+        bbox_n = maxy + buffer
+
+        # Pixel resolution in metres at watershed centroid latitude
+        centre_lat   = (miny + maxy) / 2.0
+        m_per_deg_lon = 111_320.0 * np.cos(np.radians(centre_lat))
+        m_per_deg_lat = 111_320.0
+
+        # --- Download DEM (1/3 arc-second ~10 m) ---
+        resp = requests.get(
+            _DEM_WCS,
+            params={
+                "SERVICE":  "WCS",
+                "VERSION":  "1.0.0",
+                "REQUEST":  "GetCoverage",
+                "COVERAGE": "DEP3Elevation",
+                "CRS":      "EPSG:4326",
+                "BBOX":     f"{bbox_w},{bbox_s},{bbox_e},{bbox_n}",
+                "WIDTH":    "300",
+                "HEIGHT":   "300",
+                "FORMAT":   "GeoTIFF",
+            },
+            timeout=90,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        fd, tmp_raw = tempfile.mkstemp(suffix="_dem_raw.tif")
+        with _os.fdopen(fd, "wb") as fh:
+            for chunk in resp.iter_content(65536):
+                fh.write(chunk)
+
+        # Rewrite with explicit float32 nodata so pysheds is happy
+        NODATA = np.float32(-9999.0)
+        fd2, tmp_dem = tempfile.mkstemp(suffix="_dem.tif")
+        _os.close(fd2)
+
+        with rasterio.open(tmp_raw) as src:
+            res_x      = abs(src.res[0])
+            res_y      = abs(src.res[1])
+            res_mx     = res_x * m_per_deg_lon
+            res_my     = res_y * m_per_deg_lat
+            raw_data   = src.read(1).astype(np.float32)
+            dem_transform = src.transform
+            dem_height, dem_width = raw_data.shape
+            if src.nodata is not None:
+                raw_data[raw_data == src.nodata] = NODATA
+            meta = {**src.meta, "dtype": "float32", "nodata": float(NODATA)}
+
+        with rasterio.open(tmp_dem, "w", **meta) as dst:
+            dst.write(raw_data, 1)
+
+        # --- pysheds: condition DEM → D8 flow dir → accumulation (full tile, no clip) ---
+        grid     = Grid.from_raster(tmp_dem)
+        dem_r    = grid.read_raster(tmp_dem)
+        inflated = grid.resolve_flats(
+            grid.fill_depressions(grid.fill_pits(dem_r))
+        )
+        fdir = grid.flowdir(inflated)
+        acc  = grid.accumulation(fdir)
+
+        # --- Build watershed pixel mask from StreamStats GeoJSON ---
+        # geometry_mask returns True OUTSIDE shapes → invert to get inside=True
+        ws_mask = ~_geom_mask(
+            [ws_shape.__geo_interface__],
+            out_shape=(dem_height, dem_width),
+            transform=dem_transform,
+            all_touched=True,
+        )
+
+        # --- Masked elevation array (built first — used for outlet detection) ---
+        dem_full = np.array(grid.view(inflated), dtype=float)
+        dem_full[dem_full == float(NODATA)] = np.nan
+        elev_ws = np.where(ws_mask, dem_full, np.nan)
+
+        # --- Find outlet as the watershed exit cell with highest accumulation ---
+        # An "exit cell" is a watershed pixel whose D8 neighbor falls outside the
+        # watershed mask (or off the DEM tile edge).  These are the only cells
+        # guaranteed to be reachable by distance_to_outlet; among them we pick
+        # the one with the most accumulated flow, which is the true hydrological
+        # outlet regardless of where the original pour point was placed.
+        fdir_np = np.array(fdir, dtype=np.int32)
+        acc_np  = np.array(acc,  dtype=float)
+        _D8_OFFSETS = {
+            64: (-1,  0), 128: (-1,  1),
+             1: ( 0,  1),   2: ( 1,  1),
+             4: ( 1,  0),   8: ( 1, -1),
+            16: ( 0, -1),  32: (-1, -1),
+        }
+        ws_rows, ws_cols = np.where(ws_mask)
+        exit_rows, exit_cols = [], []
+        for r, c in zip(ws_rows.tolist(), ws_cols.tolist()):
+            offset = _D8_OFFSETS.get(int(fdir_np[r, c]))
+            if offset is None:
+                continue
+            nr, nc = r + offset[0], c + offset[1]
+            if not (0 <= nr < dem_height and 0 <= nc < dem_width and ws_mask[nr, nc]):
+                exit_rows.append(r)
+                exit_cols.append(c)
+
+        if exit_rows:
+            best = int(np.argmax(acc_np[exit_rows, exit_cols]))
+            row_out, col_out = exit_rows[best], exit_cols[best]
+        else:
+            # Fallback: highest-accumulation cell anywhere inside watershed
+            acc_in_ws = np.where(ws_mask, acc_np, -np.inf)
+            row_out, col_out = np.unravel_index(np.argmax(acc_in_ws), acc_in_ws.shape)
+
+        # --- Distance to outlet → flow length (best-effort) ---
+        L_ft = None
+        _flow_err = None
+        try:
+            dist_arr = grid.distance_to_outlet(
+                x=col_out, y=row_out, fdir=fdir, xytype="index"
+            )
+            dist_np = np.array(dist_arr, dtype=float)
+            if hasattr(dist_arr, "nodata") and dist_arr.nodata is not None:
+                dist_np[dist_np == float(dist_arr.nodata)] = np.nan
+            dist_np[~np.isfinite(dist_np)] = np.nan
+            cell_size_m = np.sqrt(res_mx * res_my)
+            _ws_dist = dist_np[ws_mask]
+            if ws_mask.any() and np.any(np.isfinite(_ws_dist)):
+                max_steps = float(np.nanmax(_ws_dist))
+                if np.isfinite(max_steps) and max_steps > 0:
+                    L_ft = max_steps * cell_size_m * 3.28084
+                else:
+                    _flow_err = f"D8 flow length = {max_steps} steps (degenerate)"
+            else:
+                _flow_err = "D8 routing produced no finite distances within watershed"
+        except Exception as _fe:
+            _flow_err = str(_fe)
+
+        # --- Mean basin slope from gradient of masked DEM ---
+        dy_e, dx_e = np.gradient(elev_ws, res_my, res_mx)
+        slope_pct  = np.sqrt(dx_e**2 + dy_e**2) * 100.0
+        valid_mask = ws_mask & np.isfinite(slope_pct)
+        mean_slope = float(np.nanmean(slope_pct[valid_mask])) if valid_mask.any() else 0.0
+
+        # --- Elevation stats ---
+        elev_valid = elev_ws[np.isfinite(elev_ws)]
+        elev_min_m = float(np.nanmin(elev_valid)) if elev_valid.size > 0 else 0.0
+        elev_max_m = float(np.nanmax(elev_valid)) if elev_valid.size > 0 else 0.0
+
+        dem_bounds = (bbox_w, bbox_s, bbox_e, bbox_n)
+
+        result = {
+            "flow_length_ft": round(L_ft, 1) if L_ft is not None else None,
+            "mean_slope_pct": round(mean_slope, 2),
+            "elev_min_m":     round(elev_min_m, 1),
+            "elev_max_m":     round(elev_max_m, 1),
+            "dem_array":      elev_ws,
+            "dem_bounds":     dem_bounds,
+            "res_mx":         res_mx,
+            "res_my":         res_my,
+        }
+        if _flow_err:
+            result["_flow_length_warning"] = _flow_err
+        return result, True
+
+    except Exception as _exc:
+        import traceback as _tb
+        return {"_error": str(_exc), "_traceback": _tb.format_exc()}, False
+
+    finally:
+        for p in (tmp_raw, tmp_dem):
+            if p and _os.path.exists(p):
+                try:
+                    _os.unlink(p)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

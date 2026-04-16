@@ -5,7 +5,7 @@ All functions are unit-explicit. No external API calls here.
 """
 
 import bisect
-from reference_data import LANDUSE_TYPES, QU_TABLE, QU_TC_VALUES, QU_IAP_VALUES, SCS_TYPE_II_MASS_CURVE
+from reference_data import LANDUSE_TYPES, QU_TABLE, QU_TC_VALUES, QU_IAP_VALUES, SCS_TYPE_II_MASS_CURVE, SCS_DUH
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +264,7 @@ def cn_peak_flow(
 
     Returns peak discharge in cfs. Returns 0 if no runoff occurs.
     """
-    tbl = build_storm_table(P_D, storm_duration_hr, CN)
-    Q   = tbl[-1]["Accumulated Effective Runoff (in)"]
+    Q = cn_runoff_depth(CN, P_D)
     if Q == 0.0:
         return 0.0
 
@@ -274,6 +273,126 @@ def cn_peak_flow(
 
     qu = _interpolate_qu(Tc_hr, Ia_P)
     return round(qu * A_sqmi * Q, 1)
+
+
+# ---------------------------------------------------------------------------
+# SCS Unit Hydrograph — convolution-based peak flow (any storm duration)
+# ---------------------------------------------------------------------------
+
+def _interp_duh(t_tp: float) -> float:
+    """Linear interpolation of SCS dimensionless unit hydrograph q/qp for t/tp."""
+    times  = [t for t, _ in SCS_DUH]
+    ratios = [q for _, q in SCS_DUH]
+    t = max(times[0], min(times[-1], t_tp))
+    idx = bisect.bisect_right(times, t)
+    if idx == 0:
+        return ratios[0]
+    if idx >= len(times):
+        return ratios[-1]
+    t0, t1 = times[idx - 1], times[idx]
+    q0, q1 = ratios[idx - 1], ratios[idx]
+    return q0 if t1 == t0 else q0 + (q1 - q0) * (t - t0) / (t1 - t0)
+
+
+def scs_uh_peak_flow(
+    CN: float,
+    P_D: float,
+    A_sqmi: float,
+    Tc_hr: float,
+    duration_hr: float,
+    dt: float = 0.25,
+) -> float:
+    """
+    Peak discharge (cfs) via SCS unit hydrograph convolution.
+
+    Uses the central duration_hr window of the SCS Type II mass curve scaled
+    to P_D (Atlas 14 depth for the design duration) to generate incremental
+    runoff depths, then convolves with the SCS dimensionless unit hydrograph.
+
+    CN          : composite curve number
+    P_D         : storm depth (inches) for the design duration
+    A_sqmi      : watershed area (square miles)
+    Tc_hr       : time of concentration (hours)
+    duration_hr : design storm duration (hours)
+    dt          : time step (hours, default 0.25)
+    """
+    tbl = build_storm_table(P_D, duration_hr, CN, dt)
+    incr_runoff = [row["Incremental Effective Runoff (in)"] for row in tbl]
+
+    if sum(incr_runoff) == 0.0:
+        return 0.0
+
+    tlag = 0.6 * Tc_hr
+    tp   = dt / 2.0 + tlag
+    qp   = 484.0 * A_sqmi / tp
+
+    n_uh = max(int(5.0 * tp / dt) + 1, 20)
+    uh   = [_interp_duh((i * dt) / tp) * qp for i in range(n_uh)]
+
+    n_out = len(incr_runoff) + n_uh - 1
+    flow  = [0.0] * n_out
+    for i, q in enumerate(incr_runoff):
+        if q > 0.0:
+            for j, u in enumerate(uh):
+                flow[i + j] += q * u
+
+    return round(max(flow), 1)
+
+
+def scs_uh_hydrograph(
+    CN: float,
+    P_D: float,
+    A_sqmi: float,
+    Tc_hr: float,
+    duration_hr: float,
+    dt: float = 0.25,
+) -> dict:
+    """
+    Run the SCS UH convolution and return all intermediate arrays for display.
+
+    Returns a dict with keys:
+      "storm_table"   — list[dict] from build_storm_table()
+      "uh_times"      — list[float] hours from UH start [0, dt, 2dt, ...]
+      "uh_ordinates"  — list[float] UH ordinates in cfs/in
+      "drh_times"     — list[float] hours from storm start [0, dt, 2dt, ...]
+      "drh_flow"      — list[float] direct runoff hydrograph in cfs
+      "tp"            — float, time to peak of UH (hr)
+      "peak_flow"     — float, max(drh_flow) in cfs
+      "peak_time"     — float, time at peak_flow (hr)
+    """
+    tbl         = build_storm_table(P_D, duration_hr, CN, dt)
+    incr_runoff = [row["Incremental Effective Runoff (in)"] for row in tbl]
+
+    tlag = 0.6 * Tc_hr
+    tp   = dt / 2.0 + tlag
+    qp   = 484.0 * A_sqmi / tp
+
+    n_uh = max(int(5.0 * tp / dt) + 1, 20)
+    uh   = [_interp_duh((i * dt) / tp) * qp for i in range(n_uh)]
+
+    n_out = len(incr_runoff) + n_uh - 1
+    flow  = [0.0] * n_out
+    if sum(incr_runoff) > 0.0:
+        for i, q in enumerate(incr_runoff):
+            if q > 0.0:
+                for j, u in enumerate(uh):
+                    flow[i + j] += q * u
+
+    peak_flow = max(flow) if flow else 0.0
+    peak_idx  = flow.index(peak_flow) if peak_flow > 0 else 0
+
+    t_start = tbl[0]["Time (hr)"]
+
+    return {
+        "storm_table":  tbl,
+        "uh_times":     [round(i * dt, 4) for i in range(n_uh)],
+        "uh_ordinates": [round(v, 3) for v in uh],
+        "drh_times":    [round(t_start + i * dt, 4) for i in range(n_out)],
+        "drh_flow":     [round(v, 2) for v in flow],
+        "tp":           round(tp, 3),
+        "peak_flow":    round(peak_flow, 1),
+        "peak_time":    round(t_start + peak_idx * dt, 3),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +435,26 @@ def tc_scs_lag(L_ft: float, Y_pct: float, CN: float) -> float:
     """
     S = (1000.0 / CN) - 10.0
     return (L_ft ** 0.8 * (S + 1) ** 0.7) / (1440.0 * (Y_pct ** 0.5))
+
+
+def tc_kirpich(L_ft: float, Y_pct: float) -> float:
+    """
+    Time of concentration (hours) via the Kirpich equation (U.S. customary):
+        Tc(min) = 0.0078 * L^0.77 * S^-0.385
+
+    L_ft  : hydraulic flow length (feet)
+    Y_pct : average watershed slope (percent), converted to ft/ft as S = Y_pct / 100
+
+    Returns Tc in hours.
+    """
+    if L_ft <= 0:
+        raise ValueError(f"L_ft must be positive, got {L_ft}")
+    if Y_pct <= 0:
+        raise ValueError(f"Y_pct must be positive, got {Y_pct}")
+
+    slope_ftft = Y_pct / 100.0
+    tc_min = 0.0078 * (L_ft ** 0.77) * (slope_ftft ** -0.385)
+    return tc_min / 60.0
 
 
 def tlag_to_tc(tlag_hr: float) -> float:

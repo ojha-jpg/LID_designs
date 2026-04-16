@@ -1,0 +1,15 @@
+[server]
+maxUploadSize = 50
+
+[theme]
+base = "light"
+primaryColor = "#1a6bb0"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f4f8"
+textColor = "#1a1a2e"
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+fastReruns = true

@@ -1,0 +1,44 @@
+# Large spatial datasets — not committed
+ok_ssurgo_spatial/
+ok_ssurgo_spatial2/
+landuse/
+landuse /
+ok_streamgrid/
+soil data/
+
+# Atlas 14 file cache
+atlas14_cache/
+
+# Example Excel files
+excels/
+
+# Dev / scratch directories
+notebooks/
+dev/
+scripts/
+test_sripts/
+random/
+notes/
+docs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Claude Code
+.claude/
+
+# Misc
+requirements copy.txt
+~$*
+*.log
+*.tmp
